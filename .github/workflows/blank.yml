@@ -1,0 +1,113 @@
+```yaml
+name: Windows RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Configure RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Set-Service -Name TermService -StartupType Manual
+          Start-Service -Name TermService
+
+          Write-Host "RDP configured."
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = Join-Path $env:TEMP "tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          try {
+            $p = Start-Process `
+              -FilePath "msiexec.exe" `
+              -ArgumentList "/i `"$installer`" /qn /norestart" `
+              -Wait -PassThru
+
+            if ($p.ExitCode -notin @(0, 3010)) {
+              throw "Tailscale installation failed: $($p.ExitCode)"
+            }
+          }
+          finally {
+            Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Add TAILSCALE_AUTHKEY in repository Actions secrets."
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+            throw "Tailscale executable not found."
+          }
+
+          & $ts up "--authkey=$env:TS_AUTHKEY" `
+            "--hostname=gh-rdp-$env:GITHUB_RUN_ID"
+
+          $ip = $null
+
+          for ($i = 0; $i -lt 12 -and -not $ip; $i++) {
+            Start-Sleep -Seconds 5
+            $result = & $ts ip -4
+            if ($LASTEXITCODE -eq 0 -and $result) {
+              $ip = ($result | Select-Object -First 1).Trim()
+            }
+          }
+
+          if (-not $ip) {
+            throw "Tailscale IP was not assigned."
+          }
+
+          "TAILSCALE_IP=$ip" | Out-File `
+            -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Tailscale connected."
+
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Checking RDP service..."
+          Get-Service TermService
+
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+            throw "RDP is not listening on port 3389."
+          }
+
+          Write-Host "RDP listener is active."
+
+          # Display the private Tailscale IP only.
+          Write-Host "RDP address: $env:TAILSCALE_IP"
+          Write-Host "Use an authorized Windows account to connect."
+```
